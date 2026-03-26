@@ -1,11 +1,40 @@
-from prosperity3bt.datamodel import OrderDepth, TradingState, Order
+from prosperity3bt.datamodel import OrderDepth, TradingState, Order, ProsperityEncoder
 import json
+from typing import Any
 
 # ── constants ──────────────────────────────────────────────────────────────
-EMERALDS = 'EMERALDS'
-TOMATOES = 'TOMATOES'
+EMERALDS = "EMERALDS"
+TOMATOES = "TOMATOES"
 
 POS_LIMITS = {EMERALDS: 80, TOMATOES: 80}
+
+
+# ── logger ────────────────────────────────────────────────────────────────
+class Logger:
+    def __init__(self) -> None:
+        self.logs = ""
+
+    def print(self, *objects: Any, sep: str = " ", end: str = "\n") -> None:
+        self.logs += sep.join(map(str, objects)) + end
+
+    def flush(self, state: TradingState, orders: dict, conversions: int, trader_data: str) -> None:
+        print(
+            json.dumps(
+                {
+                    "state": state,
+                    "orders": orders,
+                    "conversions": conversions,
+                    "traderData": trader_data,
+                    "logs": self.logs,
+                },
+                cls=ProsperityEncoder,
+                separators=(",", ":"),
+            )
+        )
+        self.logs = ""
+
+
+logger = Logger()
 
 
 # ── base class ─────────────────────────────────────────────────────────────
@@ -14,29 +43,32 @@ class ProductTrader:
 
     def __init__(self, symbol, state, last_td, new_td):
         self.symbol = symbol
-        self.state  = state
+        self.state = state
         self.last_td = last_td
-        self.new_td  = new_td
-        self.orders  = []
+        self.new_td = new_td
+        self.orders = []
 
         # position
         self.pos_limit = POS_LIMITS.get(symbol, 0)
-        self.position  = state.position.get(symbol, 0)
-        self.max_buy   = self.pos_limit - self.position
-        self.max_sell  = self.pos_limit + self.position
+        self.position = state.position.get(symbol, 0)
+        self.max_buy = self.pos_limit - self.position
+        self.max_sell = self.pos_limit + self.position
 
         # order book
         od = state.order_depths.get(symbol, OrderDepth())
-        self.bids = {p: abs(v) for p, v in sorted(od.buy_orders.items(),  reverse=True)}
+        self.bids = {p: abs(v) for p, v in sorted(od.buy_orders.items(), reverse=True)}
         self.asks = {p: abs(v) for p, v in sorted(od.sell_orders.items())}
 
         # price levels
-        self.best_bid  = max(self.bids) if self.bids else None
-        self.best_ask  = min(self.asks) if self.asks else None
-        self.bid_wall  = min(self.bids) if self.bids else None
-        self.ask_wall  = max(self.asks) if self.asks else None
-        self.wall_mid  = (self.bid_wall + self.ask_wall) / 2 \
-                         if self.bid_wall and self.ask_wall else None
+        self.best_bid = max(self.bids) if self.bids else None
+        self.best_ask = min(self.asks) if self.asks else None
+        self.bid_wall = min(self.bids) if self.bids else None
+        self.ask_wall = max(self.asks) if self.asks else None
+        self.wall_mid = (
+            (self.bid_wall + self.ask_wall) / 2
+            if self.bid_wall is not None and self.ask_wall is not None
+            else None
+        )
 
     # ── order helpers ───────────────────────────────────────────────────────
     def buy(self, price, volume):
@@ -60,19 +92,17 @@ class ProductTrader:
         return result
 
     def get_orders(self):
-        return {}
+        return self.orders
 
 
 # ── strategy: Emeralds ─────────────────────────────────────────────────────
-# Stable true price — market make around wall_mid
 class EmeraldsTrader(ProductTrader):
-
     def __init__(self, state, last_td, new_td):
         super().__init__(EMERALDS, state, last_td, new_td)
 
     def get_orders(self):
         if self.wall_mid is None:
-            return {}
+            return self.orders
 
         # 1. take any profitable fills immediately
         for price, vol in self.asks.items():
@@ -97,22 +127,20 @@ class EmeraldsTrader(ProductTrader):
                 ask_price = price - 1
                 break
 
-        self.buy(bid_price,  self.max_buy)
+        self.buy(bid_price, self.max_buy)
         self.sell(ask_price, self.max_sell)
 
         return self.orders
 
 
 # ── strategy: Tomatoes ─────────────────────────────────────────────────────
-# Price drifts over time — wall_mid is still our best fair value estimate
 class TomatoesTrader(ProductTrader):
-
     def __init__(self, state, last_td, new_td):
         super().__init__(TOMATOES, state, last_td, new_td)
 
     def get_orders(self):
         if self.wall_mid is None:
-            return {}
+            return self.orders
 
         for price, vol in self.asks.items():
             if price < self.wall_mid:
@@ -122,7 +150,7 @@ class TomatoesTrader(ProductTrader):
             if price > self.wall_mid:
                 self.sell(price, vol)
 
-        self.buy(self.bid_wall + 1,  self.max_buy)
+        self.buy(self.bid_wall + 1, self.max_buy)
         self.sell(self.ask_wall - 1, self.max_sell)
 
         return self.orders
@@ -130,20 +158,20 @@ class TomatoesTrader(ProductTrader):
 
 # ── entry point ────────────────────────────────────────────────────────────
 class Trader:
-
     def run(self, state: TradingState):
-
         try:
             last_td = json.loads(state.traderData) if state.traderData else {}
-        except:
+        except Exception as e:
+            logger.print("Failed to parse traderData:", e)
             last_td = {}
 
         new_td = {}
         result = {}
+        conversions = 0
 
         traders = {
             EMERALDS: EmeraldsTrader,
-            #TOMATOES: TomatoesTrader,
+            # TOMATOES: TomatoesTrader,
         }
 
         for symbol, TraderClass in traders.items():
@@ -152,6 +180,9 @@ class Trader:
                     t = TraderClass(state, last_td, new_td)
                     result[symbol] = t.get_orders()
                 except Exception as e:
-                    print(f"ERROR {symbol}: {e}")
+                    logger.print(f"ERROR {symbol}: {e}")
 
-        return result, 0, json.dumps(new_td)
+        trader_data = json.dumps(new_td)
+
+        logger.flush(state, result, conversions, trader_data)
+        return result, conversions, trader_data
