@@ -1,32 +1,21 @@
 import json
+import re
+from pathlib import Path
 
-input_file = "test.log"
-output_file = "visualizer.log"
+input_file = Path("test.log")
+output_file = Path("visualizer.log")
+
+text = input_file.read_text(encoding="utf-8")
+
+# Find every lambdaLog string, even across multiline JSON blocks.
+pattern = re.compile(r'"lambdaLog"\s*:\s*"((?:\\.|[^"\\])*)"', re.DOTALL)
 
 out_lines = []
+for match in pattern.finditer(text):
+    escaped = match.group(1)
+    # Unescape the JSON string content
+    raw = json.loads(f'"{escaped}"')
+    out_lines.append(raw)
 
-with open(input_file, "r", encoding="utf-8") as f:
-    for line in f:
-        line = line.strip()
-
-        # Skip empty lines
-        if not line:
-            continue
-
-        # Skip non-JSON lines
-        if not line.startswith("{"):
-            continue
-
-        try:
-            obj = json.loads(line)
-        except:
-            continue
-
-        if "lambdaLog" in obj:
-            out_lines.append(obj["lambdaLog"])
-
-with open(output_file, "w", encoding="utf-8") as f:
-    for line in out_lines:
-        f.write(line + "\n")
-
-print("Done → visualizer.log ready")
+output_file.write_text("\n".join(out_lines), encoding="utf-8")
+print(f"Wrote {output_file} with {len(out_lines)} entries")
