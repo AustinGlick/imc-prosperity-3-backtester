@@ -1,7 +1,132 @@
-from prosperity3bt.datamodel import OrderDepth, TradingState, Order
-from typing import List, Dict, Tuple
 import json
-import math
+from typing import Any, List
+
+try:
+    # visualizer-style / official style
+    from datamodel import Listing, Observation, Order, OrderDepth, ProsperityEncoder, Symbol, Trade, TradingState
+except ImportError:
+    # backtester-style
+    from prosperity3bt.datamodel import Listing, Observation, Order, OrderDepth, ProsperityEncoder, Symbol, Trade, TradingState
+
+
+class Logger:
+    def __init__(self) -> None:
+        self.logs = ""
+        self.max_log_length = 3750
+
+    def print(self, *objects: Any, sep: str = " ", end: str = "\n") -> None:
+        self.logs += sep.join(map(str, objects)) + end
+
+    def flush(self, state: TradingState, orders: dict[Symbol, list[Order]], conversions: int, trader_data: str) -> None:
+        base_length = len(
+            self.to_json(
+                [
+                    self.compress_state(state, ""),
+                    self.compress_orders(orders),
+                    conversions,
+                    "",
+                    "",
+                ]
+            )
+        )
+
+        max_item_length = max(0, (self.max_log_length - base_length) // 3)
+
+        print(
+            self.to_json(
+                [
+                    self.compress_state(state, self.truncate(state.traderData, max_item_length)),
+                    self.compress_orders(orders),
+                    conversions,
+                    self.truncate(trader_data, max_item_length),
+                    self.truncate(self.logs, max_item_length),
+                ]
+            )
+        )
+
+        self.logs = ""
+
+    def compress_state(self, state: TradingState, trader_data: str) -> list[Any]:
+        return [
+            state.timestamp,
+            trader_data,
+            self.compress_listings(state.listings),
+            self.compress_order_depths(state.order_depths),
+            self.compress_trades(state.own_trades),
+            self.compress_trades(state.market_trades),
+            state.position,
+            self.compress_observations(state.observations),
+        ]
+
+    def compress_listings(self, listings: dict[Symbol, Listing]) -> list[list[Any]]:
+        return [[listing.symbol, listing.product, listing.denomination] for listing in listings.values()]
+
+    def compress_order_depths(self, order_depths: dict[Symbol, OrderDepth]) -> dict[Symbol, list[Any]]:
+        compressed = {}
+        for symbol, order_depth in order_depths.items():
+            compressed[symbol] = [order_depth.buy_orders, order_depth.sell_orders]
+        return compressed
+
+    def compress_trades(self, trades: dict[Symbol, list[Trade]]) -> list[list[Any]]:
+        compressed = []
+        for arr in trades.values():
+            for trade in arr:
+                compressed.append(
+                    [
+                        trade.symbol,
+                        trade.price,
+                        trade.quantity,
+                        trade.buyer,
+                        trade.seller,
+                        trade.timestamp,
+                    ]
+                )
+        return compressed
+
+    def compress_observations(self, observations: Observation) -> list[Any]:
+        conversion_observations = {}
+        for product, observation in observations.conversionObservations.items():
+            conversion_observations[product] = [
+                observation.bidPrice,
+                observation.askPrice,
+                observation.transportFees,
+                observation.exportTariff,
+                observation.importTariff,
+                observation.sugarPrice,
+                observation.sunlightIndex,
+            ]
+        return [observations.plainValueObservations, conversion_observations]
+
+    def compress_orders(self, orders: dict[Symbol, list[Order]]) -> list[list[Any]]:
+        compressed = []
+        for arr in orders.values():
+            for order in arr:
+                compressed.append([order.symbol, order.price, order.quantity])
+        return compressed
+
+    def to_json(self, value: Any) -> str:
+        return json.dumps(value, cls=ProsperityEncoder, separators=(",", ":"))
+
+    def truncate(self, value: str, max_length: int) -> str:
+        lo, hi = 0, min(len(value), max_length)
+        out = ""
+
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            candidate = value[:mid]
+            if len(candidate) < len(value):
+                candidate += "..."
+
+            if len(json.dumps(candidate)) <= max_length:
+                out = candidate
+                lo = mid + 1
+            else:
+                hi = mid - 1
+
+        return out
+
+
+logger = Logger()
 
 EMERALDS = "EMERALDS"
 TOMATOES = "TOMATOES"
@@ -75,10 +200,6 @@ class ProductTrader:
 
 
 class EmeraldsTrader(ProductTrader):
-    """
-    More stable product: quote around a fair value estimate and take obvious mispricings.
-    """
-
     def __init__(self, state, last_td, new_td):
         super().__init__(EMERALDS, state, last_td, new_td)
 
@@ -90,7 +211,6 @@ class EmeraldsTrader(ProductTrader):
         fair = self.ema("emeralds_fair", 25, mid)
         fair_int = int(round(fair))
 
-        # Aggressively take obvious edge
         for price, vol in self.asks.items():
             if price <= fair_int - 1 and self.max_buy > 0:
                 self.buy(price, vol)
@@ -99,10 +219,9 @@ class EmeraldsTrader(ProductTrader):
             if price >= fair_int + 1 and self.max_sell > 0:
                 self.sell(price, vol)
 
-        # Passive market making around fair value
         if self.best_bid is not None and self.best_ask is not None:
-            bid_px = min(self.best_bid + 1, fair_int - 1)
-            ask_px = max(self.best_ask - 1, fair_int + 1)
+            bid_px = min(self.best_bid + 1, fair_int)
+            ask_px = max(self.best_ask - 1, fair_int)
 
             if bid_px < ask_px:
                 if self.position > 20:
@@ -117,14 +236,6 @@ class EmeraldsTrader(ProductTrader):
 
 
 class TomatoesTrader(ProductTrader):
-    """
-    Mean-reverting product:
-    - Uses EMA fair value
-    - Adds a small imbalance tilt
-    - Trades only when edge is bigger than a few ticks
-    - Quotes conservatively to avoid overtrading
-    """
-
     def __init__(self, state, last_td, new_td):
         super().__init__(TOMATOES, state, last_td, new_td)
 
@@ -133,20 +244,13 @@ class TomatoesTrader(ProductTrader):
         if mid is None:
             return []
 
-        # Slow-ish EMA because your analysis suggests mean reversion with a long half-life.
         ema_mid = self.ema("tomatoes_ema_mid", 60, mid)
-
-        # Small imbalance adjustment:
-        # positive imbalance tends to slightly support future price, so tilt fair value up a little.
         imb = self.imbalance_l1()
         fair = ema_mid + 12.0 * imb
         fair_int = int(round(fair))
 
-        # Edge threshold:
-        # larger than 1 tick to avoid paying spread for weak signals.
         edge = 2
 
-        # Take clear mispricings
         for price, vol in self.asks.items():
             if self.max_buy <= 0:
                 break
@@ -159,33 +263,24 @@ class TomatoesTrader(ProductTrader):
             if price >= fair_int + edge:
                 self.sell(price, vol)
 
-        # Inventory skew:
-        # if long, lean sell quotes higher and reduce bid aggressiveness
-        # if short, lean buy quotes higher and reduce ask aggressiveness
         inv_ratio = self.position / self.pos_limit if self.pos_limit else 0.0
         skew = int(round(inv_ratio * 2))
 
-        # Passive quotes only if there is room in the spread
         if self.best_bid is not None and self.best_ask is not None:
             spread = self.best_ask - self.best_bid
 
-            # Only make markets when the spread is wide enough to matter.
             if spread >= 2:
                 bid_px = min(self.best_bid + 1, fair_int - 1 - skew)
                 ask_px = max(self.best_ask - 1, fair_int + 1 - skew)
 
-                # Keep quotes sane
                 if bid_px < ask_px:
-                    # Quote smaller size when inventory is already large
                     base_size = 8
                     buy_size = min(base_size, self.max_buy)
                     sell_size = min(base_size, self.max_sell)
 
                     if self.position > 25:
                         buy_size = min(3, buy_size)
-                        sell_size = min(base_size, self.max_sell)
                     elif self.position < -25:
-                        buy_size = min(base_size, self.max_buy)
                         sell_size = min(3, sell_size)
 
                     self.buy(bid_px, buy_size)
@@ -195,9 +290,6 @@ class TomatoesTrader(ProductTrader):
 
 
 class Trader:
-    def bid(self):
-        return 15
-
     def run(self, state: TradingState):
         try:
             last_td = json.loads(state.traderData) if state.traderData else {}
@@ -208,7 +300,7 @@ class Trader:
         result = {}
 
         traders = {
-            #EMERALDS: EmeraldsTrader,
+            EMERALDS: EmeraldsTrader,
             TOMATOES: TomatoesTrader,
         }
 
@@ -217,13 +309,13 @@ class Trader:
                 try:
                     t = TraderClass(state, last_td, new_td)
                     orders = t.get_orders()
-                    if orders:
-                        result[symbol] = orders
-                    else:
-                        result[symbol] = []
+                    result[symbol] = orders if orders else []
                 except Exception as e:
-                    print(f"ERROR {symbol}: {e}")
+                    logger.print(f"ERROR {symbol}: {e}")
                     result[symbol] = []
 
         conversions = 0
-        return result, conversions, json.dumps(new_td)
+        trader_data = json.dumps(new_td)
+
+        logger.flush(state, result, conversions, trader_data)
+        return result, conversions, trader_data
