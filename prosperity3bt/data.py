@@ -20,6 +20,8 @@ LIMITS = {
     "VOLCANIC_ROCK_VOUCHER_10250": 200,
     "VOLCANIC_ROCK_VOUCHER_10500": 200,
     "MAGNIFICENT_MACARONS": 75,
+    "Emeralds": 80,
+    "Tomatoes": 80,
 }
 
 
