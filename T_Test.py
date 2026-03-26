@@ -1,4 +1,4 @@
-from datamodel import OrderDepth, TradingState, Order
+from prosperity3bt.datamodel import OrderDepth, TradingState, Order
 from typing import List, Dict, Tuple
 import json
 import math
